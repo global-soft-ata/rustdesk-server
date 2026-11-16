@@ -568,6 +568,7 @@ impl RendezvousServer {
         bytes: &[u8],
         sink: &mut Option<Sink>,
         addr: SocketAddr,
+        socket_ip: IpAddr,
         key: &str,
         ws: bool,
     ) -> bool {
@@ -578,7 +579,10 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
+                    allow_err!(
+                        self.handle_tcp_punch_hole_request(addr, socket_ip, ph, key, ws)
+                            .await
+                    );
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
@@ -593,8 +597,11 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    if !crate::ip_whitelist::is_allowed(try_into_v4(addr).ip()).await {
-                        log::warn!("Drop RequestRelay from {addr} to {}: IP not allowed", rf.id);
+                    if !crate::ip_whitelist::is_allowed(socket_ip).await {
+                        log::warn!(
+                            "Drop RequestRelay from {addr} (socket {socket_ip}) to {}: IP not allowed",
+                            rf.id
+                        );
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_relay_response(RelayResponse {
                             uuid: rf.uuid,
@@ -790,6 +797,7 @@ impl RendezvousServer {
     async fn handle_punch_hole_request(
         &mut self,
         addr: SocketAddr,
+        socket_ip: IpAddr,
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
@@ -804,8 +812,13 @@ impl RendezvousServer {
             });
             return Ok((msg_out, None));
         }
-        if !crate::ip_whitelist::is_allowed(try_into_v4(addr).ip()).await {
-            log::warn!("Punch hole request from {} for peer {} denied: IP not allowed", addr, ph.id);
+        if !crate::ip_whitelist::is_allowed(socket_ip).await {
+            log::warn!(
+                "Punch hole request from {} (socket {}) for peer {} denied: IP not allowed",
+                addr,
+                socket_ip,
+                ph.id
+            );
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 other_failure: IP_NOT_ALLOWED.to_owned(),
@@ -966,11 +979,14 @@ impl RendezvousServer {
     async fn handle_tcp_punch_hole_request(
         &mut self,
         addr: SocketAddr,
+        socket_ip: IpAddr,
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        let (msg, to_addr) = self
+            .handle_punch_hole_request(addr, socket_ip, ph, key, ws)
+            .await?;
         if let Some(addr) = to_addr {
             self.tx.send(Data::Msg(msg.into(), addr))?;
         } else {
@@ -986,7 +1002,9 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
+        let (msg, to_addr) = self
+            .handle_punch_hole_request(addr, try_into_v4(addr).ip(), ph, key, false)
+            .await?;
         self.tx.send(Data::Msg(
             msg.into(),
             match to_addr {
@@ -1273,6 +1291,9 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        // Taken before the WebSocket headers can rewrite `addr`, so the IP whitelist
+        // cannot be bypassed with a forged X-Real-IP / X-Forwarded-For.
+        let socket_ip = try_into_v4(addr).ip();
         let mut sink;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -1312,7 +1333,7 @@ impl RendezvousServer {
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self.handle_tcp(&bytes, &mut sink, addr, socket_ip, key, ws).await {
                         break;
                     }
                 }
@@ -1323,7 +1344,7 @@ impl RendezvousServer {
             let (a, mut b) = framed.split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self.handle_tcp(&bytes, &mut sink, addr, socket_ip, key, ws).await {
                     break;
                 }
             }

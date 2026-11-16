@@ -92,6 +92,7 @@ pub async fn start_with_bind(
         BLOCKLIST_FILE,
         BLOCKLIST.read().await.len()
     );
+    crate::ip_whitelist::log_config();
     let port: u16 = port.parse()?;
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
@@ -443,6 +444,9 @@ async fn make_pair(
     limiter: Limiter,
     ws: bool,
 ) -> ResultType<()> {
+    // Taken before the WebSocket headers can rewrite `addr`, so the IP whitelist
+    // cannot be bypassed with a forged X-Real-IP / X-Forwarded-For.
+    let socket_ip = hbb_common::try_into_v4(addr).ip();
     if ws {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         let callback = |req: &Request, response: Response| {
@@ -476,15 +480,21 @@ async fn make_pair(
             tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
         )
         .await??;
-        make_pair_(ws_stream, addr, key, limiter).await;
+        make_pair_(ws_stream, addr, socket_ip, key, limiter).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+        make_pair_(FramedStream::from(stream, addr), addr, socket_ip, key, limiter).await;
     }
     Ok(())
 }
 
 /// Checks a configured relay key and pairs a request with a waiting connection.
-async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
+async fn make_pair_(
+    stream: impl StreamTrait,
+    addr: SocketAddr,
+    socket_ip: IpAddr,
+    key: &str,
+    limiter: Limiter,
+) {
     let mut stream = stream;
     stream.set_max_packet_length(MAX_RELAY_REQUEST_LEN);
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
@@ -492,6 +502,17 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
                 if !key.is_empty() && rf.licence_key != key {
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
+                    return;
+                }
+                // Only the initiating side names the target id; the controlled side sends just the uuid.
+                if !rf.id.is_empty() && !crate::ip_whitelist::is_allowed(socket_ip).await {
+                    log::warn!(
+                        "Relay request {} from {} (socket {}) to {} denied: IP not allowed",
+                        rf.uuid,
+                        addr,
+                        socket_ip,
+                        rf.id
+                    );
                     return;
                 }
                 if !rf.uuid.is_empty() {
