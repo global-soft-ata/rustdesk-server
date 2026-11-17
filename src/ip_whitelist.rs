@@ -10,7 +10,7 @@
 //                          be reached or answers badly (default: denied).
 
 use crate::common::get_arg;
-use hbb_common::log;
+use hbb_common::{bail, log, ResultType};
 use once_cell::sync::Lazy;
 use serde_derive::Deserialize;
 use std::{net::IpAddr, time::Duration};
@@ -57,17 +57,28 @@ static CONFIG: Lazy<Config> = Lazy::new(|| {
     }
 });
 
-pub fn log_config() {
+/// Whether an IP whitelist URL is configured.
+pub fn is_enabled() -> bool {
+    !CONFIG.url.is_empty()
+}
+
+/// Logs the whitelist settings and refuses to run it without a key, so that
+/// anonymous connections cannot make the server query the whitelist service.
+pub fn check_config(key: &str) -> ResultType<()> {
     let cfg = &*CONFIG;
-    if cfg.url.is_empty() {
+    if !is_enabled() {
         log::info!("IP_WHITELIST_URL not set, initiator IP check disabled");
-    } else {
-        log::info!(
-            "IP_WHITELIST_URL={} fail_open={}",
-            cfg.url,
-            cfg.fail_open
-        );
+        return Ok(());
     }
+    if key.is_empty() {
+        bail!("IP_WHITELIST_URL requires a key (-k); refusing to start");
+    }
+    log::info!(
+        "IP_WHITELIST_URL={} fail_open={}",
+        cfg.url,
+        cfg.fail_open
+    );
+    Ok(())
 }
 
 fn build_url(base: &str, ip: &IpAddr) -> String {

@@ -30,7 +30,8 @@ use std::{
 };
 
 type Usage = (usize, usize, usize, usize);
-type WaitingPeer = (Arc<()>, Box<dyn StreamTrait>);
+// The bool marks a leg that named a target id and so passed the IP whitelist.
+type WaitingPeer = (Arc<()>, Box<dyn StreamTrait>, bool);
 
 lazy_static::lazy_static! {
     static ref PEERS: Mutex<HashMap<String, WaitingPeer>> = Default::default();
@@ -92,7 +93,7 @@ pub async fn start_with_bind(
         BLOCKLIST_FILE,
         BLOCKLIST.read().await.len()
     );
-    crate::ip_whitelist::log_config();
+    crate::ip_whitelist::check_config(&key)?;
     let port: u16 = port.parse()?;
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
@@ -515,10 +516,22 @@ async fn make_pair_(
                     );
                     return;
                 }
+                let initiator = !rf.id.is_empty();
                 if !rf.uuid.is_empty() {
                     let mut peers = PEERS.lock().await;
-                    if let Some((_, mut peer)) = peers.remove(&rf.uuid) {
+                    if let Some((_, mut peer, peer_initiator)) = peers.remove(&rf.uuid) {
                         drop(peers);
+                        // Without this, two legs that both leave id empty would turn the
+                        // relay into a tunnel that never meets the whitelist.
+                        if crate::ip_whitelist::is_enabled() && !initiator && !peer_initiator {
+                            log::warn!(
+                                "Relay pair {} from {} (socket {}) refused: no whitelisted initiator",
+                                rf.uuid,
+                                addr,
+                                socket_ip
+                            );
+                            return;
+                        }
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
@@ -541,7 +554,10 @@ async fn make_pair_(
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
                         let generation = Arc::new(());
-                        peers.insert(rf.uuid.clone(), (generation.clone(), Box::new(stream)));
+                        peers.insert(
+                            rf.uuid.clone(),
+                            (generation.clone(), Box::new(stream), initiator),
+                        );
                         drop(peers);
                         sleep(30.).await;
                         expire_waiter(&mut *PEERS.lock().await, &rf.uuid, &generation);
@@ -554,7 +570,7 @@ async fn make_pair_(
 
 /// Removes a waiting connection only if it still owns the requested pair ID.
 fn expire_waiter(peers: &mut HashMap<String, WaitingPeer>, id: &str, generation: &Arc<()>) {
-    if peers.get(id).map(|(current, _)| Arc::ptr_eq(current, generation)).unwrap_or(false) {
+    if peers.get(id).map(|(current, _, _)| Arc::ptr_eq(current, generation)).unwrap_or(false) {
         peers.remove(id);
     }
 }
@@ -1004,7 +1020,7 @@ mod waiter_tests {
         let old = Arc::new(());
         let current = Arc::new(());
         let mut peers: HashMap<String, WaitingPeer> = HashMap::new();
-        peers.insert("pair".to_owned(), (current.clone(), Box::new(TestStream)));
+        peers.insert("pair".to_owned(), (current.clone(), Box::new(TestStream), false));
         expire_waiter(&mut peers, "pair", &old);
         assert!(peers.contains_key("pair"));
         expire_waiter(&mut peers, "pair", &current);

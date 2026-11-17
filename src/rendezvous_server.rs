@@ -238,7 +238,7 @@ impl RendezvousServer {
                 "N"
             }
         );
-        crate::ip_whitelist::log_config();
+        crate::ip_whitelist::check_config(&key)?;
         if test_addr.to_lowercase() != "no" {
             let test_addr = if test_addr.is_empty() {
                 listener.local_addr()?

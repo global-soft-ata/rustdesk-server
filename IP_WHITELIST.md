@@ -32,20 +32,42 @@ Na inicialização, os dois servidores registram no log se a checagem está ativ
 
 ### hbbr ([`src/relay_server.rs`](src/relay_server.rs), função `make_pair_`)
 
-A checagem roda logo depois da validação da key e **antes** de a conexão ser
-colocada em espera ou pareada:
+Cada sessão de relay tem duas conexões com o mesmo `uuid`. Só a do
+**iniciador** envia `RequestRelay.id` preenchido (o ID do destino). A conexão do
+lado controlado manda só o `uuid`. Só o iniciador precisa estar na whitelist: o
+IP do controlado nunca é consultado e nunca libera nada.
 
-- Cada sessão de relay tem duas pernas com o mesmo `uuid`. Só a do **iniciador**
-  envia `RequestRelay.id` preenchido (o ID do destino). A perna do lado controlado
-  manda só o `uuid`.
-- Por isso só a perna com `id` preenchido é checada. O dispositivo controlado
-  não precisa estar na whitelist.
-- Se o IP for negado, o hbbr fecha a conexão sem resposta (o protocolo do relay
-  não tem mensagem de recusa) e registra
-  `Relay request <uuid> from <addr> (socket <ip>) to <id> denied: IP not allowed`.
+1. **Checagem do iniciador:** logo depois da validação da key, a conexão com
+   `id` preenchido é checada. Se o IP for negado, o hbbr fecha a conexão sem
+   resposta (o protocolo do relay não tem mensagem de recusa) antes de ela ficar
+   esperando ou ser pareada. O log registra
+   `Relay request <uuid> from <addr> (socket <ip>) to <id> denied: IP not allowed`.
+2. **Regra do par:** com a whitelist ativa, um par só é formado se pelo menos
+   uma das duas conexões for um iniciador aprovado. Sem isso, duas conexões com
+   `id` vazio (por exemplo, um script que controla as duas pontas e usa o relay
+   como túnel) seriam pareadas sem passar pela whitelist. Nesse caso, as duas
+   são fechadas sem consultar a API, e o log registra
+   `Relay pair <uuid> ... refused: no whitelisted initiator`.
+
+| Situação | Resultado |
+| --- | --- |
+| Iniciador liberado (com `id`) + controlado (sem `id`) | pareia, com uma consulta |
+| Iniciador não liberado (com `id`) | fechado antes de esperar |
+| Duas conexões sem `id` | par recusado, sem consultar a API |
+
+Com a whitelist desligada, o pareamento funciona como no upstream.
 
 Para isso, [`src/hbbr.rs`](src/hbbr.rs) passou a declarar `mod ip_whitelist;`, e
-`start_with_bind` chama `ip_whitelist::log_config()`.
+`start_with_bind` chama `ip_whitelist::check_config(&key)`.
+
+### Key obrigatória
+
+Com `IP_WHITELIST_URL` definido, hbbs e hbbr **se recusam a iniciar sem key**
+(`IP_WHITELIST_URL requires a key (-k); refusing to start`). Isso impede que
+conexões anônimas façam o servidor consultar a API. O hbbs já gera uma key por
+padrão (`-`), mas o hbbr não, então nele é preciso passar `-k`. Os serviços
+instalados usam `-k _`. A key é a chave pública distribuída aos clientes, então
+ela reduz o abuso casual, mas não é um segredo.
 
 ## Proteção contra spoofing por `X-Real-IP` / `X-Forwarded-For`
 
@@ -72,14 +94,23 @@ não acontece.
 
 ## Limitações conhecidas
 
-- Um cliente modificado poderia omitir `RequestRelay.id` no hbbr para escapar da
-  checagem. Mesmo assim, ele não consegue montar uma sessão sozinho: o lado
-  controlado só se conecta ao hbbr quando o hbbs manda (via `RequestRelay` ou
-  `PunchHole`), e o hbbs já checou o IP do iniciador. Na prática, o hbbs é a
-  barreira principal e o hbbr é uma defesa em profundidade.
+- A regra do par depende de o cliente RustDesk do técnico mandar `id` no
+  `RequestRelay` ao relay, o que o cliente oficial faz. Se uma sessão legítima
+  via relay for recusada com `no whitelisted initiator`, a causa é essa.
 - Não há cache de respostas: cada pedido gera uma requisição HTTP.
 
 ## Verificação
 
 - `cargo build --bin hbbs --bin hbbr`: compila sem warnings novos.
 - `cargo test --bin hbbr --lib`: todos os testes existentes passam (13 + 12).
+- Teste de ponta a ponta com um hbbr real e um script que abre as duas conexões
+  (pelo IP da LAN, porque conexões TCP de loopback caem no console
+  administrativo do hbbr):
+
+  | Cenário | Resultado |
+  | --- | --- |
+  | Whitelist ativa, duas conexões sem `id` | recusado (`no whitelisted initiator`) |
+  | Whitelist ativa, iniciador negado | iniciador fechado (`denied: IP not allowed`) |
+  | Whitelist ativa, iniciador liberado | pareado, dados repassados |
+  | Whitelist desligada, duas conexões sem `id` | pareado (comportamento do upstream) |
+  | Whitelist ativa, hbbr sem `-k` | não inicia |
