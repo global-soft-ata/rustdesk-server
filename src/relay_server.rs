@@ -30,7 +30,8 @@ use std::{
 };
 
 type Usage = (usize, usize, usize, usize);
-type WaitingPeer = (Arc<()>, Box<dyn StreamTrait>);
+// The bool marks a leg that named a target id and so passed the IP whitelist.
+type WaitingPeer = (Arc<()>, Box<dyn StreamTrait>, bool);
 
 lazy_static::lazy_static! {
     static ref PEERS: Mutex<HashMap<String, WaitingPeer>> = Default::default();
@@ -92,6 +93,7 @@ pub async fn start_with_bind(
         BLOCKLIST_FILE,
         BLOCKLIST.read().await.len()
     );
+    crate::ip_whitelist::check_config(&key)?;
     let port: u16 = port.parse()?;
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
@@ -443,6 +445,9 @@ async fn make_pair(
     limiter: Limiter,
     ws: bool,
 ) -> ResultType<()> {
+    // Taken before the WebSocket headers can rewrite `addr`, so the IP whitelist
+    // cannot be bypassed with a forged X-Real-IP / X-Forwarded-For.
+    let socket_ip = hbb_common::try_into_v4(addr).ip();
     if ws {
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
         let callback = |req: &Request, response: Response| {
@@ -476,15 +481,21 @@ async fn make_pair(
             tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
         )
         .await??;
-        make_pair_(ws_stream, addr, key, limiter).await;
+        make_pair_(ws_stream, addr, socket_ip, key, limiter).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+        make_pair_(FramedStream::from(stream, addr), addr, socket_ip, key, limiter).await;
     }
     Ok(())
 }
 
 /// Checks a configured relay key and pairs a request with a waiting connection.
-async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
+async fn make_pair_(
+    stream: impl StreamTrait,
+    addr: SocketAddr,
+    socket_ip: IpAddr,
+    key: &str,
+    limiter: Limiter,
+) {
     let mut stream = stream;
     stream.set_max_packet_length(MAX_RELAY_REQUEST_LEN);
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
@@ -494,10 +505,33 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
                     return;
                 }
+                // Only the initiating side names the target id; the controlled side sends just the uuid.
+                if !rf.id.is_empty() && !crate::ip_whitelist::is_allowed(socket_ip).await {
+                    log::warn!(
+                        "Relay request {} from {} (socket {}) to {} denied: IP not allowed",
+                        rf.uuid,
+                        addr,
+                        socket_ip,
+                        rf.id
+                    );
+                    return;
+                }
+                let initiator = !rf.id.is_empty();
                 if !rf.uuid.is_empty() {
                     let mut peers = PEERS.lock().await;
-                    if let Some((_, mut peer)) = peers.remove(&rf.uuid) {
+                    if let Some((_, mut peer, peer_initiator)) = peers.remove(&rf.uuid) {
                         drop(peers);
+                        // Without this, two legs that both leave id empty would turn the
+                        // relay into a tunnel that never meets the whitelist.
+                        if crate::ip_whitelist::is_enabled() && !initiator && !peer_initiator {
+                            log::warn!(
+                                "Relay pair {} from {} (socket {}) refused: no whitelisted initiator",
+                                rf.uuid,
+                                addr,
+                                socket_ip
+                            );
+                            return;
+                        }
                         log::info!("Relayrequest {} from {} got paired", rf.uuid, addr);
                         let id = format!("{}:{}", addr.ip(), addr.port());
                         USAGE.write().await.insert(id.clone(), Default::default());
@@ -520,7 +554,10 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
                     } else {
                         log::info!("New relay request {} from {}", rf.uuid, addr);
                         let generation = Arc::new(());
-                        peers.insert(rf.uuid.clone(), (generation.clone(), Box::new(stream)));
+                        peers.insert(
+                            rf.uuid.clone(),
+                            (generation.clone(), Box::new(stream), initiator),
+                        );
                         drop(peers);
                         sleep(30.).await;
                         expire_waiter(&mut *PEERS.lock().await, &rf.uuid, &generation);
@@ -533,7 +570,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
 
 /// Removes a waiting connection only if it still owns the requested pair ID.
 fn expire_waiter(peers: &mut HashMap<String, WaitingPeer>, id: &str, generation: &Arc<()>) {
-    if peers.get(id).map(|(current, _)| Arc::ptr_eq(current, generation)).unwrap_or(false) {
+    if peers.get(id).map(|(current, _, _)| Arc::ptr_eq(current, generation)).unwrap_or(false) {
         peers.remove(id);
     }
 }
@@ -983,7 +1020,7 @@ mod waiter_tests {
         let old = Arc::new(());
         let current = Arc::new(());
         let mut peers: HashMap<String, WaitingPeer> = HashMap::new();
-        peers.insert("pair".to_owned(), (current.clone(), Box::new(TestStream)));
+        peers.insert("pair".to_owned(), (current.clone(), Box::new(TestStream), false));
         expire_waiter(&mut peers, "pair", &old);
         assert!(peers.contains_key("pair"));
         expire_waiter(&mut peers, "pair", &current);

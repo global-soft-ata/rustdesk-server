@@ -61,6 +61,7 @@ type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
 const MAX_RELAY_UUID_LEN: usize = 128;
+const IP_NOT_ALLOWED: &str = "Your IP is not allowed to connect";
 
 // The peer sends this uuid to whatever relay_server names, so keep control bytes out of it.
 fn validate_relay_uuid(value: &str) -> Result<(), &'static str> {
@@ -237,6 +238,7 @@ impl RendezvousServer {
                 "N"
             }
         );
+        crate::ip_whitelist::check_config(&key)?;
         if test_addr.to_lowercase() != "no" {
             let test_addr = if test_addr.is_empty() {
                 listener.local_addr()?
@@ -566,6 +568,7 @@ impl RendezvousServer {
         bytes: &[u8],
         sink: &mut Option<Sink>,
         addr: SocketAddr,
+        socket_ip: IpAddr,
         key: &str,
         ws: bool,
     ) -> bool {
@@ -576,7 +579,10 @@ impl RendezvousServer {
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
                     }
-                    allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
+                    allow_err!(
+                        self.handle_tcp_punch_hole_request(addr, socket_ip, ph, key, ws)
+                            .await
+                    );
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
@@ -590,6 +596,20 @@ impl RendezvousServer {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                    }
+                    if !crate::ip_whitelist::is_allowed(socket_ip).await {
+                        log::warn!(
+                            "Drop RequestRelay from {addr} (socket {socket_ip}) to {}: IP not allowed",
+                            rf.id
+                        );
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_relay_response(RelayResponse {
+                            uuid: rf.uuid,
+                            refuse_reason: IP_NOT_ALLOWED.to_owned(),
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                        return true;
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
@@ -777,6 +797,7 @@ impl RendezvousServer {
     async fn handle_punch_hole_request(
         &mut self,
         addr: SocketAddr,
+        socket_ip: IpAddr,
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
@@ -787,6 +808,20 @@ impl RendezvousServer {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        if !crate::ip_whitelist::is_allowed(socket_ip).await {
+            log::warn!(
+                "Punch hole request from {} (socket {}) for peer {} denied: IP not allowed",
+                addr,
+                socket_ip,
+                ph.id
+            );
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                other_failure: IP_NOT_ALLOWED.to_owned(),
                 ..Default::default()
             });
             return Ok((msg_out, None));
@@ -944,11 +979,14 @@ impl RendezvousServer {
     async fn handle_tcp_punch_hole_request(
         &mut self,
         addr: SocketAddr,
+        socket_ip: IpAddr,
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        let (msg, to_addr) = self
+            .handle_punch_hole_request(addr, socket_ip, ph, key, ws)
+            .await?;
         if let Some(addr) = to_addr {
             self.tx.send(Data::Msg(msg.into(), addr))?;
         } else {
@@ -964,7 +1002,9 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
+        let (msg, to_addr) = self
+            .handle_punch_hole_request(addr, try_into_v4(addr).ip(), ph, key, false)
+            .await?;
         self.tx.send(Data::Msg(
             msg.into(),
             match to_addr {
@@ -1251,6 +1291,9 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        // Taken before the WebSocket headers can rewrite `addr`, so the IP whitelist
+        // cannot be bypassed with a forged X-Real-IP / X-Forwarded-For.
+        let socket_ip = try_into_v4(addr).ip();
         let mut sink;
         if ws {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -1290,7 +1333,7 @@ impl RendezvousServer {
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
-                    if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                    if !self.handle_tcp(&bytes, &mut sink, addr, socket_ip, key, ws).await {
                         break;
                     }
                 }
@@ -1301,7 +1344,7 @@ impl RendezvousServer {
             let (a, mut b) = framed.split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
-                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                if !self.handle_tcp(&bytes, &mut sink, addr, socket_ip, key, ws).await {
                     break;
                 }
             }
