@@ -13,6 +13,7 @@ Igual nos dois binários, por variável de ambiente ou pelo `.env`:
 | `IP_WHITELIST_URL` | Endpoint GET que responde `{"allowed": bool}`. `{ip}` na URL é trocado pelo IP; sem `{ip}`, é adicionado `?ip=<IP>`. Se ficar vazio, a checagem é desligada. |
 | `IP_WHITELIST_TIMEOUT_MS` | Timeout da requisição (padrão `3000`). |
 | `IP_WHITELIST_FAIL_OPEN` | `Y` deixa passar quando o serviço está fora do ar ou responde algo inválido. O padrão é negar. |
+| `IP_WHITELIST_CACHE_MS` | Por quanto tempo a resposta do serviço para um IP, liberado **ou negado**, é reaproveitada (padrão `10000`; `0` desliga). Falhas de consulta não entram no cache. |
 
 > **Atenção:** o hbbr agora também lê essas variáveis. Elas precisam estar
 > definidas no ambiente do hbbr, já que o `run-hbbs.sh` só configura o hbbs.
@@ -97,7 +98,20 @@ não acontece.
 - A regra do par depende de o cliente RustDesk do técnico mandar `id` no
   `RequestRelay` ao relay, o que o cliente oficial faz. Se uma sessão legítima
   via relay for recusada com `no whitelisted initiator`, a causa é essa.
-- Não há cache de respostas: cada pedido gera uma requisição HTTP.
+- Cache: liberar ou bloquear um IP no serviço pode levar até
+  `IP_WHITELIST_CACHE_MS` para valer. Cada processo (hbbs e hbbr) tem o seu
+  próprio cache em memória. Ele só guarda respostas válidas: se a consulta
+  falhar (timeout, HTTP de erro, JSON inválido), vale o `FAIL_OPEN` e a próxima
+  conexão consulta de novo. O cache usa a lib
+  [`moka`](https://crates.io/crates/moka) (`future::Cache`): validade por
+  entrada, teto de 65 536 IPs (a moka descarta as entradas menos úteis) e
+  limpeza incremental. Conexões simultâneas do mesmo IP com o cache vazio geram
+  **uma** consulta ao Gestor; as demais esperam a mesma resposta.
+- Dependência: o `ed25519` 1.5.0 declara `signature = ">=1.3.1"`, sem limite
+  superior. Ao re-resolver o grafo (como no `cargo add moka`), o cargo junta o
+  `signature` 1.5.0 com o 2.2.0 e a compilação quebra. O `Cargo.lock` mantém o
+  `ed25519` apontando para o `signature 1.5.0`; se ele for regenerado, é
+  preciso refazer esse ajuste.
 
 ## Verificação
 
